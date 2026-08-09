@@ -3,6 +3,7 @@ name: バス到着時刻記録
 on:
   schedule:
     # JST 06:00 = UTC 21:00（前日）
+    # 月〜金 JST → 日〜木 UTC
     - cron: '0 21 * * 0-4'
 
   workflow_dispatch:
@@ -50,22 +51,15 @@ jobs:
           IGNORE_TIME_CHECK: ${{ inputs.ignore_time_check && '1' || '0' }}
           DEBUG_STATETABLE: "0"
 
-      - name: CSVとJSONをコミット
+      - name: 89番データをArtifactに保存
         if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git pull --rebase origin main || true
-
-          git add \
-            data/raw/89_up/bus_arrival_log.csv \
-            data/raw/89_up/bus_live_position.json || true
-
-          git diff --staged --quiet || \
-            git commit -m "🚌 89番バス到着記録 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
-
-          git push || true
+        uses: actions/upload-artifact@v4
+        with:
+          name: bus-data-89
+          path: |
+            data/raw/89_up/bus_arrival_log.csv
+            data/raw/89_up/bus_live_position.json
+          if-no-files-found: ignore
 
 
   # ==========================================================
@@ -100,19 +94,66 @@ jobs:
           IGNORE_TIME_CHECK: ${{ inputs.ignore_time_check && '1' || '0' }}
           DEBUG_STATETABLE: "0"
 
-      - name: CSVとJSONをコミット
+      - name: 98番データをArtifactに保存
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bus-data-98
+          path: |
+            data/raw/98_up/bus_arrival_log.csv
+            data/raw/98_up/bus_live_position.json
+          if-no-files-found: ignore
+
+
+  # ==========================================================
+  # GitHubへ保存
+  # ==========================================================
+  save:
+    name: CSVとJSONをGitHubへ保存
+    runs-on: ubuntu-latest
+    needs:
+      - track-89
+      - track-98
+
+    if: always()
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 89番データを取得
+        uses: actions/download-artifact@v4
+        with:
+          name: bus-data-89
+          path: .
+
+      - name: 98番データを取得
+        uses: actions/download-artifact@v4
+        with:
+          name: bus-data-98
+          path: .
+
+      - name: GitHubへ保存
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git pull --rebase origin main || true
+          git pull --rebase origin main
 
           git add \
+            data/raw/89_up/bus_arrival_log.csv \
+            data/raw/89_up/bus_live_position.json \
             data/raw/98_up/bus_arrival_log.csv \
-            data/raw/98_up/bus_live_position.json || true
+            data/raw/98_up/bus_live_position.json
 
-          git diff --staged --quiet || \
-            git commit -m "🚌 98番バス到着記録 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
-
-          git push || true
+          if git diff --staged --quiet; then
+            echo "変更なし"
+          else
+            git commit -m "🚌 バス到着記録 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
+            git push
+          fi
