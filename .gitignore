@@ -9,10 +9,18 @@ __pycache__/
 .env
 
 # Generated data
-data/raw/
+data/raw/*
 data/processed/
 data/output/
 
+# バス追跡ログはGitHubに保存
+!data/raw/89_up/
+!data/raw/89_up/bus_arrival_log.csv
+!data/raw/89_up/bus_live_position.json
+
+!data/raw/98_up/
+!data/raw/98_up/bus_arrival_log.csv
+!data/raw/98_up/bus_live_position.json
+
 # Jupyter
 .ipynb_checkpoints/
-
