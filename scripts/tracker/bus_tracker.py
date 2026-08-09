@@ -1,420 +1,1708 @@
 """
-バスなび沖縄 89番 糸満線（上り）全停留所追跡スクリプト
-======================================================
-・BusStateTable APIでサーバー判定済みのバス停在席情報を取得
-・各バス停の定刻を時刻表から照合して遅延を自動計算
+bus_tracker.py
 
-インストール:
-    pip install requests
+バスなび沖縄 リアルタイムバス停追跡
+
+対応路線:
+    89_up
+    98_up
+    その他、route_configに追加可能
 
 実行:
-    python bus_tracker_final.py
+    python scripts/tracker/bus_tracker.py --route 89_up
+    python scripts/tracker/bus_tracker.py --route 98_up
+
+テスト:
+    IGNORE_TIME_CHECK=1 python scripts/tracker/bus_tracker.py --route 89_up
+
+必要ライブラリ:
+    pip install requests pandas beautifulsoup4
 """
 
-import requests
+from __future__ import annotations
+
+import argparse
 import csv
+import json
+import math
 import os
+import re
+import subprocess
 import sys
 import time
-import math
-import re
-import json
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
-sys.stdout.reconfigure(line_buffering=True)
+import pandas as pd
+import requests
+
+
+# ============================================================
+# 基本設定
+# ============================================================
+
 JST = timezone(timedelta(hours=9))
 
-LIVE_JSON = "bus_live_position.json"  # リアルタイム地図用の最新バス位置ファイル
+POLL_INTERVAL = 30
+
+SCHEDULE_MATCH_MINUTES = 20
+
+BASE_URL = "https://www.busnavi-okinawa.com/top/Location"
+
 
 # ============================================================
-# 設定
+# プロジェクトパス
 # ============================================================
 
-POLL_INTERVAL          = 30   # 秒
-SCHEDULE_MATCH_MINUTES = 20   # 定刻との照合許容範囲（分）
-OUTPUT_CSV             = "bus_arrival_log.csv"
+BASE_DIR = Path(__file__).resolve().parents[2]
+
 
 # ============================================================
-# 各バス停の定刻（平日 7〜10時）
-# 出典: https://www.kotsu-okinawa.org/time/89/up1.html
+# 路線設定
 # ============================================================
 
-TIMETABLE = {
-    "糸満バスターミナル":  ['07:05','07:10','07:25','07:40','07:55','08:10','08:30','08:50','09:15','09:40','09:55','10:10'],
-    "糸満市役所入口":     ['07:05','07:10','07:25','07:41','07:55','08:10','08:31','08:50','09:15','09:40','09:55','10:10'],
-    "糸満市場入口":      ['07:06','07:11','07:26','07:42','07:56','08:11','08:32','08:51','09:16','09:41','09:56'],
-    "糸満ロータリー":     ['07:07','07:12','07:26','07:43','07:57','08:12','08:32','08:52','09:17','09:42','09:57'],
-    "糸満西区":         ['07:08','07:13','07:27','07:44','07:58','08:13','08:33','08:52','09:17','09:42','09:57'],
-    "白銀堂前":         ['07:08','07:13','07:27','07:44','07:58','08:13','08:33','08:53','09:18','09:43','09:58'],
-    "糸満入口":         ['07:09','07:15','07:28','07:45','07:59','08:14','08:34','08:54','09:19','09:44','09:59'],
-    "西崎入口":         ['07:11','07:17','07:30','07:47','08:01','08:16','08:36','08:56','09:21','09:46','10:01'],
-    "西崎小学校入口":     ['07:18','08:18'],
-    "工業団地入口":      ['07:19','08:19'],
-    "西崎二丁目":       ['07:20','08:20'],
-    "西崎第二団地前":     ['07:22','08:22'],
-    "西崎運動公園前":     ['07:23','08:23'],
-    "西崎中学校入口":     ['07:25','08:25'],
-    "潮平":           ['07:13','07:31','07:48','08:02','08:37','08:57','09:22','09:47','10:02'],
-    "阿波根":           ['07:15','07:26','07:33','07:50','08:04','08:27','08:39','08:59','09:24','09:49','10:04'],
-    "翁長":            ['07:00','07:16','07:27','07:34','07:51','08:05','08:28','08:40','09:00','09:25','09:50','10:05'],
-    "翁長入口":          ['07:01','07:17','07:28','07:35','07:52','08:06','08:29','08:41','09:01','09:26','09:51','10:06'],
-    "豊見城南高校前":     ['07:02','07:18','07:29','07:37','07:54','08:08','08:31','08:42','09:02','09:27','09:52','10:07'],
-    "与根入口":          ['07:03','07:19','07:30','07:38','07:56','08:10','08:33','08:44','09:04','09:29','09:54','10:09'],
-    "座安入口":          ['07:03','07:19','07:30','07:38','07:57','08:11','08:34','08:45','09:04','09:29','09:54','10:09'],
-    "伊良波":           ['07:04','07:20','07:31','07:39','07:58','08:12','08:35','08:46','09:05','09:30','09:55','10:10'],
-    "我那覇":           ['07:05','07:21','07:32','07:40','07:59','08:13','08:36','08:47','09:06','09:31','09:56'],
-    "名嘉地":           ['07:06','07:23','07:34','07:42','08:01','08:15','08:38','08:49','09:08','09:32','09:57'],
-    "高良":            ['07:08','07:25','07:37','07:45','08:03','08:17','08:40','08:51','09:10','09:35','10:00'],
-    "宇栄原入口":        ['07:09','07:26','07:38','07:46','08:05','08:18','08:41','08:52','09:11','09:36','10:01'],
-    "新町入口":          ['07:09','07:26','07:38','07:46','08:06','08:19','08:42','08:52','09:11','09:36','10:01'],
-    "第二ゲート":        ['07:10','07:28','07:40','07:47','08:07','08:20','08:43','08:53','09:12','09:37','10:02'],
-    "赤嶺駅前":          ['07:11','07:30','07:42','07:49','08:08','08:22','08:44','08:54','09:13','09:38','10:03'],
-    "赤嶺安里原":        ['07:13','07:32','07:44','07:51','08:10','08:24','08:46','08:56','09:15','09:39','10:04'],
-    "小禄駅前":          ['07:01','07:15','07:35','07:47','07:54','08:12','08:26','08:48','08:58','09:17','09:41','10:06'],
-    "田原":            ['07:02','07:16','07:36','07:48','07:55','08:13','08:27','08:49','08:59','09:18','09:42','10:07'],
-    "那覇西高校前":       ['07:03','07:17','07:37','07:49','07:56','08:15','08:29','08:51','09:01','09:19','09:43','10:08'],
-    "航空隊前":          [],
-    "金城":            ['07:05','07:19','07:39','07:51','07:58','08:17','08:31','08:53','09:03','09:21','09:45','10:10'],
-    "軍桟橋前":          ['07:07','07:21','07:42','07:54','08:01','08:20','08:33','08:55','09:05','09:23','09:47'],
-    "公園前":           ['07:08','07:23','07:45','07:57','08:04','08:22','08:35','08:57','09:06','09:24','09:48'],
-    # 那覇バスターミナルは経由により複数回登場するため定刻リストを統合
-    "那覇バスターミナル":   ['07:01','07:11','07:17','07:27','07:29','07:46','07:50','08:02','08:09','08:12','08:20',
-                          '08:27','08:28','08:41','08:46','09:01','09:01','09:09','09:21','09:27','09:29','09:47','09:51'],
-    "旭町":            ['07:03','07:13','07:29','07:53','08:04','08:11','08:29','08:43','09:03','09:11','09:29','09:53'],
-    "西壺川":           ['07:04','07:15','07:31','07:55','08:05','08:13','08:31','08:44','09:04','09:12','09:31','09:55'],
-    "壺川":            ['07:05','07:16','07:32','07:56','08:06','08:14','08:32','08:45','09:05','09:13','09:32','09:56'],
-    "農協会館前":        ['07:06','07:18','07:34','07:58','08:07','08:16','08:34','08:47','09:07','09:15','09:34','09:58'],
-    "与儀小学校前":       ['07:07','07:19','07:35','07:59','08:08','08:17','08:35','08:48','09:08','09:17','09:36','10:00'],
-    "与儀十字路":        ['07:08','07:20','07:37','08:01','08:09','08:19','08:37','08:50','09:10','09:19','09:38','10:02'],
-    "開南":            ['07:10','07:23','07:40','08:04','08:12','08:21','08:39','08:53','09:13','09:22','09:40','10:04'],
-    "那覇高校前":        ['07:12','07:25','07:41','08:06','08:14','08:23','08:41','08:55','09:15','09:24','09:42','10:06'],
-    "県庁南口":          ['07:14','07:26','07:43','08:08','08:16','08:24','08:42','08:57','09:17','09:25','09:43','10:07'],
-    "上泉":            ['07:15','07:27','07:44','08:10','08:18','08:25','08:43','08:58','09:18','09:26','09:44','10:08'],
+ROUTES = {
+
+    # --------------------------------------------------------
+    # 89番 糸満線 上り
+    # --------------------------------------------------------
+
+    "89_up": {
+
+        "route_no": "89",
+
+        "route_name": "89番 糸満線",
+
+        "direction": "up",
+
+        "direction_name": "上り",
+
+        "keitou_sid":
+            "f05ce44e-f2f9-4686-90b4-ff244e1c5813",
+
+        "course_group_sid":
+            "37e827b7-aab1-4971-afa2-7e3d915e722d",
+
+        "course_sid":
+            "AllStations",
+
+        "course_name":
+            "全停留所表示",
+
+    },
+
+
+    # --------------------------------------------------------
+    # 98番 琉大線 上り
+    #
+    # 現在はSID未設定
+    # 98番のバスなび沖縄ページから取得して設定する
+    # --------------------------------------------------------
+
+    "98_up": {
+
+        "route_no": "98",
+
+        "route_name": "98番 琉大線",
+
+        "direction": "up",
+
+        "direction_name": "上り",
+
+        "keitou_sid":
+            "ed0ad81d-cd34-43c8-95a9-b8a88cad67a7",
+
+        "course_group_sid":
+            "a57af64c-6c6f-439e-951c-46fb5ef4f804",
+
+        "course_sid":
+            "AllStations",
+
+        "course_name":
+            "全停留所表示",
+
+    },
+
 }
 
-# ============================================================
-# API パラメータ
-# ============================================================
 
-BASE_URL         = "https://www.busnavi-okinawa.com/top/Location"
-KEITOU_SID       = "f05ce44e-f2f9-4686-90b4-ff244e1c5813"
-COURSE_GROUP_SID = "37e827b7-aab1-4971-afa2-7e3d915e722d"
-COURSE_SID       = "AllStations"
-COURSE_NAME      = "全停留所表示"
+# ============================================================
+# HTTP設定
+# ============================================================
 
 HEADERS = {
-    "Referer": "https://www.busnavi-okinawa.com/top/Location",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "X-Requested-With": "XMLHttpRequest",
+
+    "Referer":
+        "https://www.busnavi-okinawa.com/top/Location",
+
+    "User-Agent":
+        (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/131.0 Safari/537.36"
+        ),
+
+    "X-Requested-With":
+        "XMLHttpRequest",
+
 }
 
-API_PARAMS = {
-    "datetime": "28",
-    "keitouSid": KEITOU_SID,
-    "courseGroupSid": COURSE_GROUP_SID,
-    "courseSid": COURSE_SID,
-    "courseName": COURSE_NAME,
-}
 
 # ============================================================
+# 引数
+# ============================================================
 
-def fetch_with_retry(url, params, retries=3, timeout=30):
-    for attempt in range(1, retries + 1):
-        try:
-            p = {**params, "_": int(time.time() * 1000)}
-            resp = requests.get(url, params=p, headers=HEADERS, timeout=timeout)
-            resp.raise_for_status()
-            return resp
-        except Exception as e:
-            print(f"\n  ⚠ 取得失敗({attempt}/{retries}): {e}")
-            if attempt < retries:
-                time.sleep(5 * attempt)
-    return None
+def parse_args():
 
-def fetch_bus_state_table():
-    """
-    BusStateTable: サーバー側判定済みの「どのバス停にバスがいるか」を取得。
-    レスポンスはJSON文字列としてエスケープされているため resp.json() でデコードする。
+    parser = argparse.ArgumentParser(
+        description="バスなび沖縄 リアルタイムバス停追跡"
+    )
 
-    <dt>タグの出現位置で区切ったセグメント単位で解析する
-    （</dd>への非貪欲マッチは入れ子構造で誤動作するため、dt位置分割が確実）。
+    parser.add_argument(
+        "--route",
+        required=True,
+        choices=ROUTES.keys(),
+        help="追跡する路線ID",
+    )
 
-    構造は2パターン:
-      A) <dt>番号</dt> ... バス停名・Sid・(あれば)icon_bus.png ...
-         → そのバス停に滞在中のバス
-      B) <dt class="iconBusDT"></dt> ... icon_busNow.png ...
-         → 直前のバス停(Aの最後に見つかったバス停)を出発し移動中のバス
+    return parser.parse_args()
 
-    {sid: {"name": ..., "has_bus": bool}} を返す。
-    """
-    resp = fetch_with_retry(f"{BASE_URL}/BusStateTable", API_PARAMS)
-    if not resp:
+
+# ============================================================
+# 路線設定取得
+# ============================================================
+
+def get_route_config(route_id):
+
+    if route_id not in ROUTES:
+
+        raise ValueError(
+            f"未登録の路線です: {route_id}"
+        )
+
+    config = ROUTES[route_id]
+
+    if not config["keitou_sid"]:
+
+        raise ValueError(
+            f"{route_id} の keitouSid が未設定です"
+        )
+
+    if not config["course_group_sid"]:
+
+        raise ValueError(
+            f"{route_id} の courseGroupSid が未設定です"
+        )
+
+    return config
+
+
+# ============================================================
+# パス生成
+# ============================================================
+
+def get_paths(route_id):
+
+    route_dir = (
+        BASE_DIR
+        / "data"
+        / "routes"
+        / route_id
+    )
+
+    master_dir = (
+        route_dir
+        / "master"
+    )
+
+    raw_dir = (
+        BASE_DIR
+        / "data"
+        / "raw"
+        / route_id
+    )
+
+    raw_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    processed_dir = (
+        BASE_DIR
+        / "data"
+        / "processed"
+    )
+
+    processed_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    return {
+
+        "route_dir":
+            route_dir,
+
+        "stop_times":
+            master_dir
+            / "stop_times.csv",
+
+        "arrival_log":
+            raw_dir
+            / "bus_arrival_log.csv",
+
+        "live_json":
+            raw_dir
+            / "bus_live_position.json",
+
+    }
+
+
+# ============================================================
+# 時刻変換
+# ============================================================
+
+def time_to_seconds(value):
+
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    if not text:
         return None
 
     try:
-        html = resp.json()  # JSON文字列としてデコード（\uXXXXエスケープを解決）
-        if not isinstance(html, str):
-            html = resp.text
+
+        parts = text.split(":")
+
+        if len(parts) != 2:
+            return None
+
+        hour = int(parts[0])
+        minute = int(parts[1])
+
+        return (
+            hour * 3600
+            + minute * 60
+        )
+
     except Exception:
-        html = resp.text
+
+        return None
+
+
+# ============================================================
+# StopTimes読込
+# ============================================================
+
+def load_stop_times(stop_times_file):
+
+    if not stop_times_file.exists():
+
+        raise FileNotFoundError(
+            f"stop_times.csv がありません:\n"
+            f"{stop_times_file}"
+        )
+
+    stop_times = pd.read_csv(
+        stop_times_file,
+        encoding="utf-8-sig",
+    )
+
+    required = [
+        "trip_id",
+        "trip_no",
+        "route_id",
+        "direction",
+        "stop_id",
+        "stop_name",
+        "stop_order",
+        "scheduled_time",
+    ]
+
+    missing = [
+        col
+        for col in required
+        if col not in stop_times.columns
+    ]
+
+    if missing:
+
+        raise ValueError(
+            "stop_times.csv に必要な列がありません: "
+            + ", ".join(missing)
+        )
+
+    stop_times["scheduled_sec"] = (
+        stop_times["scheduled_time"]
+        .apply(time_to_seconds)
+    )
+
+    stop_times = stop_times.dropna(
+        subset=["scheduled_sec"]
+    ).copy()
+
+    stop_times["scheduled_sec"] = (
+        stop_times["scheduled_sec"]
+        .astype(int)
+    )
+
+    stop_times["stop_order"] = (
+        pd.to_numeric(
+            stop_times["stop_order"],
+            errors="coerce",
+        )
+    )
+
+    return stop_times
+
+
+# ============================================================
+# StopTimesから時刻表を作成
+# ============================================================
+
+def build_timetable(stop_times):
+
+    timetable = {}
+
+    for stop_name, group in stop_times.groupby(
+        "stop_name"
+    ):
+
+        times = (
+            group["scheduled_time"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+        timetable[stop_name] = sorted(
+            times,
+            key=lambda x: time_to_seconds(x)
+            if time_to_seconds(x) is not None
+            else 999999
+        )
+
+    return timetable
+
+
+# ============================================================
+# 路線の始発・終点停留所
+# ============================================================
+
+def get_route_stops(stop_times):
+
+    stops = (
+        stop_times[
+            [
+                "stop_id",
+                "stop_name",
+                "stop_order",
+            ]
+        ]
+        .drop_duplicates()
+        .sort_values("stop_order")
+    )
+
+    return stops.reset_index(drop=True)
+
+
+# ============================================================
+# APIパラメータ
+# ============================================================
+
+def build_api_params(config):
+
+    return {
+
+        "datetime":
+            "28",
+
+        "keitouSid":
+            config["keitou_sid"],
+
+        "courseGroupSid":
+            config["course_group_sid"],
+
+        "courseSid":
+            config["course_sid"],
+
+        "courseName":
+            config["course_name"],
+
+    }
+
+
+# ============================================================
+# APIリクエスト
+# ============================================================
+
+def fetch_with_retry(
+    url,
+    params,
+    retries=3,
+    timeout=30,
+):
+
+    for attempt in range(
+        1,
+        retries + 1,
+    ):
+
+        try:
+
+            p = {
+                **params,
+                "_":
+                    int(
+                        time.time()
+                        * 1000
+                    ),
+            }
+
+            response = requests.get(
+                url,
+                params=p,
+                headers=HEADERS,
+                timeout=timeout,
+            )
+
+            response.raise_for_status()
+
+            return response
+
+        except Exception as e:
+
+            print(
+                f"\n  ⚠ 取得失敗 "
+                f"({attempt}/{retries}): {e}"
+            )
+
+            if attempt < retries:
+
+                time.sleep(
+                    5 * attempt
+                )
+
+    return None
+
+
+# ============================================================
+# BusStateTable
+# ============================================================
+
+def fetch_bus_state_table(api_params):
+
+    response = fetch_with_retry(
+        f"{BASE_URL}/BusStateTable",
+        api_params,
+    )
+
+    if response is None:
+        return None
+
+    try:
+
+        html = response.json()
+
+        if not isinstance(
+            html,
+            str,
+        ):
+
+            html = response.text
+
+    except Exception:
+
+        html = response.text
 
     result = {}
-    last_name, last_sid = None, None
 
-    # <dt>タグの出現位置で区切る（通常版と iconBusDT 版の両方にマッチ）
-    dt_positions = [m.start() for m in re.finditer(r'<dt(?:\s+class="iconBusDT")?>', html)]
+    last_name = None
+    last_sid = None
+
+    dt_positions = [
+        m.start()
+        for m in re.finditer(
+            r'<dt(?:\s+class="iconBusDT")?>',
+            html,
+        )
+    ]
+
     segments = []
-    for i, pos in enumerate(dt_positions):
-        end = dt_positions[i + 1] if i + 1 < len(dt_positions) else len(html)
-        segments.append(html[pos:end])
+
+    for i, pos in enumerate(
+        dt_positions
+    ):
+
+        if (
+            i + 1
+            < len(dt_positions)
+        ):
+
+            end = dt_positions[i + 1]
+
+        else:
+
+            end = len(html)
+
+        segments.append(
+            html[pos:end]
+        )
 
     for seg in segments:
-        num_m = re.match(r'<dt(?:\s+class="iconBusDT")?>(\d*)</dt>', seg)
-        num = num_m.group(1) if num_m else ""
-        has_bus = "icon_bus" in seg  # icon_bus.png / icon_busNow.png 両対応
+
+        num_match = re.match(
+            r'<dt(?:\s+class="iconBusDT")?>(\d*)</dt>',
+            seg,
+        )
+
+        num = (
+            num_match.group(1)
+            if num_match
+            else ""
+        )
+
+        has_bus = (
+            "icon_bus" in seg
+        )
+
+        # ----------------------------------------------------
+        # 通常のバス停
+        # ----------------------------------------------------
 
         if num != "":
-            # パターンA: 通常のバス停セグメント
-            # 実際のHTML: onclick="busstopClickPopUpInfo(0);" >バス停名</a>
-            # busstopClickPopUpInfo(数字); の直後に " (属性終端) → 空白 → > と続く
-            name_m = re.search(r'busstopClickPopUpInfo\(\d+\);?"\s*>([^<]+)</a>', seg)
-            sid_m  = re.search(r"getStationNo\(['\"]([^'\"]+)['\"]\)", seg)
 
-            if name_m and sid_m:
-                last_name = name_m.group(1).strip()
-                last_sid  = sid_m.group(1)
+            name_match = re.search(
+                r'busstopClickPopUpInfo\(\d+\);?"\s*>([^<]+)</a>',
+                seg,
+            )
+
+            sid_match = re.search(
+                r"getStationNo\(['\"]([^'\"]+)['\"]\)",
+                seg,
+            )
+
+            if (
+                name_match
+                and sid_match
+            ):
+
+                last_name = (
+                    name_match
+                    .group(1)
+                    .strip()
+                )
+
+                last_sid = (
+                    sid_match
+                    .group(1)
+                )
+
             else:
-                # 名前/Sidの抽出に失敗した場合でも、バス停番号をキーにして
-                # has_bus フラグだけは必ず記録する（バス検知の取りこぼし防止）
-                last_name = f"停留所#{num}（名称取得失敗）"
-                last_sid  = f"unknown-{num}"
 
-            result[last_sid] = {"name": last_name, "has_bus": has_bus}
+                last_name = (
+                    f"停留所#{num}"
+                    "（名称取得失敗）"
+                )
+
+                last_sid = (
+                    f"unknown-{num}"
+                )
+
+            result[last_sid] = {
+
+                "name":
+                    last_name,
+
+                "has_bus":
+                    has_bus,
+
+            }
+
+        # ----------------------------------------------------
+        # 移動中のバス
+        # ----------------------------------------------------
+
         else:
-            # パターンB: 移動中バス → 直前のバス停に紐づける
-            if has_bus and last_sid:
-                result[last_sid] = {"name": last_name, "has_bus": True}
 
-    if os.environ.get("DEBUG_STATETABLE") == "1":
-        print(f"  [DEBUG] segments: {len(segments)}")
-        print(f"  [DEBUG] icon_bus in html: {html.count('icon_bus')}")
-        print(f"  [DEBUG] result has_bus count: {sum(1 for v in result.values() if v['has_bus'])}")
+            if (
+                has_bus
+                and last_sid
+            ):
+
+                result[last_sid] = {
+
+                    "name":
+                        last_name,
+
+                    "has_bus":
+                        True,
+
+                }
 
     return result
 
-def fetch_bus_location():
-    resp = fetch_with_retry(f"{BASE_URL}/BusLocation", API_PARAMS)
-    if not resp:
-        return None
-    return resp.json()
 
-def get_nearest_schedule(stop_name, now_hhmm):
-    """バス停名で時刻表を引いて最も近い定刻と遅延分を返す（部分一致）"""
-    timetable = []
-    for key, times in TIMETABLE.items():
-        if key in stop_name or stop_name in key:
-            timetable = times
-            break
-    if not timetable:
+# ============================================================
+# BusLocation
+# ============================================================
+
+def fetch_bus_location(api_params):
+
+    response = fetch_with_retry(
+        f"{BASE_URL}/BusLocation",
+        api_params,
+    )
+
+    if response is None:
+        return None
+
+    try:
+
+        return response.json()
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# 最寄り定刻
+# ============================================================
+
+def get_nearest_schedule(
+    stop_name,
+    now_hhmm,
+    timetable,
+):
+
+    if not stop_name:
+
         return "", None
 
-    now = datetime.strptime(now_hhmm, "%H:%M")
-    best_sched, best_delay = "", None
+    # --------------------------------------------------------
+    # 完全一致
+    # --------------------------------------------------------
+
+    times = timetable.get(
+        stop_name,
+        [],
+    )
+
+    # --------------------------------------------------------
+    # 部分一致
+    # --------------------------------------------------------
+
+    if not times:
+
+        for key, values in timetable.items():
+
+            if (
+                key in stop_name
+                or stop_name in key
+            ):
+
+                times = values
+
+                break
+
+    if not times:
+
+        return "", None
+
+    now_sec = time_to_seconds(
+        now_hhmm
+    )
+
+    if now_sec is None:
+
+        return "", None
+
+    best_sched = ""
+
+    best_delay = None
+
     best_abs = float("inf")
 
-    for t in timetable:
-        sched = datetime.strptime(t, "%H:%M")
-        diff  = int((now - sched).total_seconds() / 60)
-        if -5 <= diff <= SCHEDULE_MATCH_MINUTES and abs(diff) < best_abs:
-            best_abs   = abs(diff)
-            best_sched = t
-            best_delay = diff
-    return best_sched, best_delay
+    for sched in times:
+
+        sched_sec = time_to_seconds(
+            sched
+        )
+
+        if sched_sec is None:
+            continue
+
+        diff_min = int(
+            (
+                now_sec
+                - sched_sec
+            )
+            / 60
+        )
+
+        if (
+            -5
+            <= diff_min
+            <= SCHEDULE_MATCH_MINUTES
+        ):
+
+            if (
+                abs(diff_min)
+                < best_abs
+            ):
+
+                best_abs = abs(
+                    diff_min
+                )
+
+                best_sched = sched
+
+                best_delay = (
+                    diff_min
+                )
+
+    return (
+        best_sched,
+        best_delay,
+    )
+
+
+# ============================================================
+# 状況判定
+# ============================================================
 
 def judge_status(delay):
-    if delay is None: return "定刻不明"
-    if -1 <= delay <= 3: return "定時"
-    if delay > 3: return f"遅延 +{delay}分"
-    return f"早着 {delay}分"
 
-def match_bus_to_stop(buses, stop_lat, stop_lon):
-    if not buses or not stop_lat:
+    if delay is None:
+
+        return "定刻不明"
+
+    if (
+        -1
+        <= delay
+        <= 3
+    ):
+
+        return "定時"
+
+    if delay > 3:
+
+        return (
+            f"遅延 +{delay}分"
+        )
+
+    return (
+        f"早着 {delay}分"
+    )
+
+
+# ============================================================
+# 距離計算
+# ============================================================
+
+def calculate_distance(
+    lat1,
+    lon1,
+    lat2,
+    lon2,
+):
+
+    try:
+
+        lat1 = float(lat1)
+        lon1 = float(lon1)
+
+        lat2 = float(lat2)
+        lon2 = float(lon2)
+
+    except Exception:
+
+        return float("inf")
+
+    R = 6371000
+
+    p1 = math.radians(lat1)
+
+    p2 = math.radians(lat2)
+
+    dp = math.radians(
+        lat2 - lat1
+    )
+
+    dl = math.radians(
+        lon2 - lon1
+    )
+
+    a = (
+        math.sin(dp / 2) ** 2
+        +
+        math.cos(p1)
+        * math.cos(p2)
+        * math.sin(dl / 2) ** 2
+    )
+
+    return (
+        R
+        * 2
+        * math.atan2(
+            math.sqrt(a),
+            math.sqrt(1 - a),
+        )
+    )
+
+
+# ============================================================
+# バス停に最も近い車両
+# ============================================================
+
+def match_bus_to_stop(
+    buses,
+    stop_lat,
+    stop_lon,
+):
+
+    if (
+        not buses
+        or not stop_lat
+        or not stop_lon
+    ):
+
         return "", ""
-    best_dist = float("inf")
-    best_plate, best_company = "", ""
+
+    best_distance = float(
+        "inf"
+    )
+
+    best_plate = ""
+
+    best_company = ""
+
     for bus_data in buses:
-        pos = bus_data.get("Position", {})
-        lat, lon = pos.get("Latitude"), pos.get("Longitude")
+
+        position = bus_data.get(
+            "Position",
+            {},
+        )
+
+        lat = position.get(
+            "Latitude"
+        )
+
+        lon = position.get(
+            "Longitude"
+        )
+
         if not lat or not lon:
             continue
-        R = 6371000
-        p1, p2 = math.radians(float(stop_lat)), math.radians(float(lat))
-        dp = math.radians(float(lat) - float(stop_lat))
-        dl = math.radians(float(lon) - float(stop_lon))
-        a  = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
-        dist = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-        if dist < best_dist:
-            best_dist    = dist
-            bus          = bus_data.get("Bus", {})
-            best_plate   = bus.get("NumberPlate", "")
-            best_company = bus.get("Company", {}).get("Name", "")
-    return best_plate, best_company
 
-def save_record(rec):
-    exists = os.path.exists(OUTPUT_CSV)
-    with open(OUTPUT_CSV, "a", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "日付", "到着時刻", "定刻", "遅延(分)", "状況",
-            "系統", "バス停名", "ナンバー", "バス会社"
-        ])
-        if not exists:
-            w.writeheader()
-        w.writerow(rec)
-    print(f"  💾 {rec['バス停名'][:15]:15s} 着:{rec['到着時刻']} 定刻:{rec['定刻']:5s} [{rec['状況']}]")
+        distance = (
+            calculate_distance(
+                stop_lat,
+                stop_lon,
+                lat,
+                lon,
+            )
+        )
 
-def save_live_positions(buses, now):
-    """リアルタイム地図表示用に、現在のバス位置をJSONファイルへ書き出す"""
-    items = []
-    if buses:
-        for b in buses:
-            pos = b.get("Position", {})
-            bus = b.get("Bus", {})
-            lat, lon = pos.get("Latitude"), pos.get("Longitude")
-            if not lat or not lon:
-                continue
-            items.append({
-                "lat": lat,
-                "lon": lon,
-                "plate": bus.get("NumberPlate", ""),
-                "company": bus.get("Company", {}).get("Name", ""),
-            })
-    payload = {
-        "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "route": "89番 糸満線（上り）",
-        "buses": items,
-    }
-    with open(LIVE_JSON, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        if (
+            distance
+            < best_distance
+        ):
 
-def push_live_json():
-    """
-    bus_live_position.json をその都度コミット・プッシュしてリアルタイム性を持たせる。
-    bus_arrival_log.csv も実行中に追記され続けているため、未コミットの変更として
-    残っているとgit pull --rebaseが失敗する。そのため両方をまとめてコミットする。
-    """
+            best_distance = distance
+
+            bus = bus_data.get(
+                "Bus",
+                {},
+            )
+
+            best_plate = (
+                bus.get(
+                    "NumberPlate",
+                    "",
+                )
+            )
+
+            company = bus.get(
+                "Company",
+                {},
+            )
+
+            best_company = (
+                company.get(
+                    "Name",
+                    "",
+                )
+            )
+
+    return (
+        best_plate,
+        best_company,
+    )
+
+
+# ============================================================
+# バス停座標取得
+# ============================================================
+
+def fetch_station_coords(
+    api_params
+):
+
+    station_coords = {}
+
     try:
-        os.system('git config user.name "github-actions[bot]"')
-        os.system('git config user.email "github-actions[bot]@users.noreply.github.com"')
-        # 両方のファイルをステージング（CSVが存在しない場合は無視される）
-        os.system(f"git add {LIVE_JSON} {OUTPUT_CSV}")
-        # ステージされた変更がある場合のみコミット（無ければエラーにせず続行）
-        os.system('git commit -m "live update" --quiet || true')
-        # rebase pullが失敗した場合は中断して次回に持ち越す（CSVの記録自体は失われない）
-        pull_result = os.system("git pull --rebase --quiet origin main")
-        if pull_result != 0:
-            os.system("git rebase --abort 2>/dev/null || true")
-            print("  ⚠ pull --rebase 失敗のためpushをスキップ（次回再試行）")
-            return
-        os.system("git push --quiet")
+
+        params = {
+            **api_params,
+            "_":
+                int(
+                    time.time()
+                    * 1000
+                ),
+        }
+
+        response = requests.get(
+            f"{BASE_URL}/GetStations",
+            params=params,
+            headers=HEADERS,
+            timeout=30,
+        )
+
+        response.raise_for_status()
+
+        stations = response.json()
+
+        for station in stations:
+
+            sid = station.get(
+                "Sid",
+                "",
+            )
+
+            position = station.get(
+                "Position",
+                {},
+            )
+
+            station_coords[sid] = {
+
+                "lat":
+                    position.get(
+                        "Latitude"
+                    ),
+
+                "lon":
+                    position.get(
+                        "Longitude"
+                    ),
+
+            }
+
+        print(
+            f"  {len(station_coords)}件取得"
+        )
+
     except Exception as e:
-        print(f"  ⚠ push失敗: {e}")
+
+        print(
+            f"  取得失敗: {e}"
+        )
+
+    return station_coords
+
+
+# ============================================================
+# 到着ログ保存
+# ============================================================
+
+def save_record(
+    output_csv,
+    record,
+):
+
+    output_csv.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    exists = (
+        output_csv.exists()
+    )
+
+    fieldnames = [
+
+        "日付",
+        "到着時刻",
+        "定刻",
+        "遅延(分)",
+        "状況",
+        "系統",
+        "バス停名",
+        "ナンバー",
+        "バス会社",
+
+    ]
+
+    with open(
+        output_csv,
+        "a",
+        newline="",
+        encoding="utf-8-sig",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+        )
+
+        if not exists:
+
+            writer.writeheader()
+
+        writer.writerow(record)
+
+    print(
+        f"  💾 "
+        f"{record['バス停名'][:15]:15s} "
+        f"着:{record['到着時刻']} "
+        f"定刻:{record['定刻'] or '-----':5s} "
+        f"[{record['状況']}]"
+    )
+
+
+# ============================================================
+# リアルタイム位置保存
+# ============================================================
+
+def save_live_positions(
+    live_json,
+    buses,
+    now,
+    config,
+):
+
+    items = []
+
+    if buses:
+
+        for bus_data in buses:
+
+            position = bus_data.get(
+                "Position",
+                {},
+            )
+
+            bus = bus_data.get(
+                "Bus",
+                {},
+            )
+
+            lat = position.get(
+                "Latitude"
+            )
+
+            lon = position.get(
+                "Longitude"
+            )
+
+            if (
+                not lat
+                or not lon
+            ):
+
+                continue
+
+            items.append({
+
+                "lat":
+                    lat,
+
+                "lon":
+                    lon,
+
+                "plate":
+                    bus.get(
+                        "NumberPlate",
+                        "",
+                    ),
+
+                "company":
+                    bus.get(
+                        "Company",
+                        {}
+                    ).get(
+                        "Name",
+                        "",
+                    ),
+
+            })
+
+    payload = {
+
+        "updated_at":
+            now.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+
+        "route_id":
+            config["route_no"],
+
+        "route":
+            config["route_name"],
+
+        "direction":
+            config["direction"],
+
+        "buses":
+            items,
+
+    }
+
+    live_json.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with open(
+        live_json,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            payload,
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+# ============================================================
+# Git push
+# ============================================================
+
+def push_live_files(
+    live_json,
+    arrival_csv,
+):
+
+    try:
+
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "user.name",
+                "github-actions[bot]",
+            ],
+            check=False,
+        )
+
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "user.email",
+                "github-actions[bot]@users.noreply.github.com",
+            ],
+            check=False,
+        )
+
+        subprocess.run(
+            [
+                "git",
+                "add",
+                str(live_json),
+                str(arrival_csv),
+            ],
+            check=False,
+        )
+
+        result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--cached",
+                "--quiet",
+            ],
+            check=False,
+        )
+
+        if result.returncode == 0:
+
+            return
+
+        subprocess.run(
+            [
+                "git",
+                "commit",
+                "-m",
+                "live update",
+                "--quiet",
+            ],
+            check=False,
+        )
+
+        pull = subprocess.run(
+            [
+                "git",
+                "pull",
+                "--rebase",
+                "--quiet",
+                "origin",
+                "main",
+            ],
+            check=False,
+        )
+
+        if pull.returncode != 0:
+
+            subprocess.run(
+                [
+                    "git",
+                    "rebase",
+                    "--abort",
+                ],
+                check=False,
+            )
+
+            print(
+                "  ⚠ pull --rebase "
+                "失敗のためpushをスキップ"
+            )
+
+            return
+
+        subprocess.run(
+            [
+                "git",
+                "push",
+                "--quiet",
+            ],
+            check=False,
+        )
+
+    except Exception as e:
+
+        print(
+            f"  ⚠ push失敗: {e}"
+        )
+
+
+# ============================================================
+# メイン
+# ============================================================
 
 def main():
-    print("=" * 60)
-    print("  バスなび沖縄 89番 糸満線（上り）全停留所追跡")
-    print("=" * 60)
-    print(f"  現在時刻(JST): {datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  時刻表バス停数: {len(TIMETABLE)}停留所")
-    print(f"  更新間隔    : {POLL_INTERVAL}秒")
-    print(f"  記録先     : {OUTPUT_CSV}")
-    print("=" * 60)
 
-    # バス停座標を取得（ナンバー照合用）
-    print("\nバス停座標を取得中...")
-    station_coords = {}
-    try:
-        p = {**API_PARAMS, "_": int(time.time()*1000)}
-        resp = requests.get(f"{BASE_URL}/GetStations", params=p, headers=HEADERS, timeout=30)
-        for s in resp.json():
-            pos = s.get("Position", {})
-            station_coords[s.get("Sid", "")] = {
-                "lat": pos.get("Latitude"),
-                "lon": pos.get("Longitude"),
-            }
-        print(f"  {len(station_coords)}件取得")
-    except Exception as e:
-        print(f"  取得失敗: {e}")
+    args = parse_args()
 
-    print(f"\n監視開始（Ctrl+C で停止）\n")
+    route_id = args.route
+
+    config = get_route_config(
+        route_id
+    )
+
+    paths = get_paths(
+        route_id
+    )
+
+    # --------------------------------------------------------
+    # StopTimes
+    # --------------------------------------------------------
+
+    stop_times = load_stop_times(
+        paths["stop_times"]
+    )
+
+    timetable = build_timetable(
+        stop_times
+    )
+
+    route_stops = get_route_stops(
+        stop_times
+    )
+
+    # --------------------------------------------------------
+    # API
+    # --------------------------------------------------------
+
+    api_params = build_api_params(
+        config
+    )
+
+    # --------------------------------------------------------
+    # 表示
+    # --------------------------------------------------------
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        f"  バスなび沖縄 "
+        f"{config['route_name']} "
+        f"（{config['direction_name']}）"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        f"  route_id     : {route_id}"
+    )
+
+    print(
+        f"  route_no     : "
+        f"{config['route_no']}"
+    )
+
+    print(
+        f"  停留所数     : "
+        f"{len(route_stops)}"
+    )
+
+    print(
+        f"  便数         : "
+        f"{stop_times['trip_id'].nunique()}"
+    )
+
+    print(
+        f"  更新間隔     : "
+        f"{POLL_INTERVAL}秒"
+    )
+
+    print(
+        f"  到着ログ     : "
+        f"{paths['arrival_log']}"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    # --------------------------------------------------------
+    # バス停座標
+    # --------------------------------------------------------
+
+    print(
+        "\nバス停座標を取得中..."
+    )
+
+    station_coords = (
+        fetch_station_coords(
+            api_params
+        )
+    )
+
+    # --------------------------------------------------------
+    # 監視
+    # --------------------------------------------------------
+
+    print(
+        "\n監視開始"
+    )
+
+    print(
+        "Ctrl+C で停止\n"
+    )
 
     prev_state = {}
+
     count = 0
 
+    ignore_time_check = (
+        os.environ.get(
+            "IGNORE_TIME_CHECK",
+            "0",
+        )
+        == "1"
+    )
+
     while True:
+
         count += 1
-        now = datetime.now(JST)
 
-        # IGNORE_TIME_CHECK=1 を設定すると時間帯チェックを無視して即座に監視開始
-        # （手動テスト実行用。本番のcronでは設定しない）
-        ignore_time_check = os.environ.get("IGNORE_TIME_CHECK", "0") == "1"
+        now = datetime.now(
+            JST
+        )
 
-        # 9時以降は監視終了
-        if not ignore_time_check and now.hour >= 9:
-            print(f"[{now.strftime('%H:%M:%S')}] 監視時間終了（9時）— スクリプトを終了します")
+        # ----------------------------------------------------
+        # 時間帯
+        # ----------------------------------------------------
+
+        if (
+            not ignore_time_check
+            and now.hour >= 9
+        ):
+
+            print(
+                f"[{now.strftime('%H:%M:%S')}] "
+                "監視時間終了（9時）"
+            )
+
             break
 
-        if not ignore_time_check and now.hour < 7:
-            print(f"[{now.strftime('%H:%M:%S')}] 監視時間前 — 60秒待機")
+        if (
+            not ignore_time_check
+            and now.hour < 7
+        ):
+
+            print(
+                f"[{now.strftime('%H:%M:%S')}] "
+                "監視時間前 — 60秒待機"
+            )
+
             time.sleep(60)
+
             continue
 
-        print(f"[#{count}] {now.strftime('%H:%M:%S')} 取得中...", end=" ", flush=True)
+        # ----------------------------------------------------
+        # API取得
+        # ----------------------------------------------------
 
-        state = fetch_bus_state_table()
+        print(
+            f"[#{count}] "
+            f"{now.strftime('%H:%M:%S')} "
+            "取得中...",
+            end=" ",
+            flush=True,
+        )
+
+        state = fetch_bus_state_table(
+            api_params
+        )
+
         if state is None:
-            print("取得失敗 — 再試行待機")
-            time.sleep(POLL_INTERVAL)
+
+            print(
+                "取得失敗"
+            )
+
+            time.sleep(
+                POLL_INTERVAL
+            )
+
             continue
 
-        buses  = fetch_bus_location()
-        save_live_positions(buses, now)  # リアルタイム地図用JSONを更新
-        # 3回（約90秒）に1回だけGitHubにpushしてレート制限を回避
+        buses = fetch_bus_location(
+            api_params
+        )
+
+        # ----------------------------------------------------
+        # live position
+        # ----------------------------------------------------
+
+        save_live_positions(
+            paths["live_json"],
+            buses,
+            now,
+            config,
+        )
+
+        # ----------------------------------------------------
+        # 3回に1回push
+        # ----------------------------------------------------
+
         if count % 3 == 0:
-            push_live_json()
-        active = [v["name"] for v in state.values() if v["has_bus"]]
-        print(f"バスあり {len(active)}停留所" + (f": {active[0][:12]}..." if active else ""))
+
+            push_live_files(
+                paths["live_json"],
+                paths["arrival_log"],
+            )
+
+        active = [
+
+            value["name"]
+
+            for value in state.values()
+
+            if value["has_bus"]
+
+        ]
+
+        print(
+            f"バスあり "
+            f"{len(active)}停留所"
+        )
+
+        # ----------------------------------------------------
+        # 到着判定
+        # ----------------------------------------------------
 
         for sid, info in state.items():
-            was_there = prev_state.get(sid, False)
-            is_there  = info["has_bus"]
 
-            if is_there and not was_there:
-                now_hhmm = now.strftime("%H:%M")
-                name     = info["name"]
-                sched, delay = get_nearest_schedule(name, now_hhmm)
-                status   = judge_status(delay)
-                coords   = station_coords.get(sid, {})
-                plate, company = match_bus_to_stop(buses, coords.get("lat"), coords.get("lon"))
+            was_there = (
+                prev_state.get(
+                    sid,
+                    False,
+                )
+            )
 
-                rec = {
-                    "日付":    now.strftime("%Y/%m/%d"),
-                    "到着時刻": now_hhmm,
-                    "定刻":    sched,
-                    "遅延(分)": delay if delay is not None else "",
-                    "状況":    status,
-                    "系統":    "89",
-                    "バス停名": name,
-                    "ナンバー": plate,
-                    "バス会社": company,
+            is_there = (
+                info["has_bus"]
+            )
+
+            # ------------------------------------------------
+            # 到着
+            # ------------------------------------------------
+
+            if (
+                is_there
+                and not was_there
+            ):
+
+                now_hhmm = (
+                    now.strftime(
+                        "%H:%M"
+                    )
+                )
+
+                stop_name = (
+                    info["name"]
+                )
+
+                sched, delay = (
+                    get_nearest_schedule(
+                        stop_name,
+                        now_hhmm,
+                        timetable,
+                    )
+                )
+
+                status = (
+                    judge_status(
+                        delay
+                    )
+                )
+
+                coords = (
+                    station_coords.get(
+                        sid,
+                        {},
+                    )
+                )
+
+                plate, company = (
+                    match_bus_to_stop(
+                        buses,
+                        coords.get(
+                            "lat"
+                        ),
+                        coords.get(
+                            "lon"
+                        ),
+                    )
+                )
+
+                record = {
+
+                    "日付":
+                        now.strftime(
+                            "%Y/%m/%d"
+                        ),
+
+                    "到着時刻":
+                        now_hhmm,
+
+                    "定刻":
+                        sched,
+
+                    "遅延(分)":
+                        delay
+                        if delay is not None
+                        else "",
+
+                    "状況":
+                        status,
+
+                    "系統":
+                        config["route_no"],
+
+                    "バス停名":
+                        stop_name,
+
+                    "ナンバー":
+                        plate,
+
+                    "バス会社":
+                        company,
+
                 }
-                print(f"\n  🚌 到着: {name}")
-                save_record(rec)
 
-            elif not is_there and was_there:
-                print(f"  → 離脱: {info['name']}")
+                print(
+                    f"\n  🚌 到着: "
+                    f"{stop_name}"
+                )
 
-        prev_state = {sid: v["has_bus"] for sid, v in state.items()}
-        time.sleep(POLL_INTERVAL)
+                save_record(
+                    paths["arrival_log"],
+                    record,
+                )
+
+            # ------------------------------------------------
+            # 離脱
+            # ------------------------------------------------
+
+            elif (
+                not is_there
+                and was_there
+            ):
+
+                print(
+                    f"  → 離脱: "
+                    f"{info['name']}"
+                )
+
+        # ----------------------------------------------------
+        # 状態更新
+        # ----------------------------------------------------
+
+        prev_state = {
+
+            sid:
+                value["has_bus"]
+
+            for sid, value
+            in state.items()
+
+        }
+
+        time.sleep(
+            POLL_INTERVAL
+        )
+
+
+# ============================================================
+# 実行
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print(
+            "\n\n監視を停止しました。"
+        )
+
+    except Exception as e:
+
+        print(
+            "\n\nエラー:"
+        )
+
+        print(e)
+
+        raise

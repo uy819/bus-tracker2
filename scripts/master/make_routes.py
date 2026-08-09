@@ -1,22 +1,117 @@
-"""routes.csv を作成する。"""
+"""路線マスタを作成する。"""
+
 from argparse import ArgumentParser
 from pathlib import Path
 
 import pandas as pd
 
 
+# ============================================================
+# パス
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parents[2]
+
+
+# ============================================================
+# 路線設定
+# ============================================================
+
+ROUTES = {
+    "89_up": {
+        "route_no": "89",
+        "route_name": "糸満線",
+        "direction": "up",
+    },
+
+    "98_up": {
+        "route_no": "98",
+        "route_name": "琉大線",
+        "direction": "up",
+    },
+}
+
+
+# ============================================================
+# 引数
+# ============================================================
+
 parser = ArgumentParser()
-parser.add_argument("--route-id", default="89_up")
-parser.add_argument("--route-no", default="89")
-parser.add_argument("--route-name", default="糸満線")
-parser.add_argument("--direction", default="up")
+
+parser.add_argument(
+    "--route-id",
+    required=True,
+    help="路線ID 例: 89_up / 98_up",
+)
+
 args = parser.parse_args()
 
-base_dir = Path(__file__).resolve().parents[2]
-output_file = base_dir / "data" / "routes" / args.route_id / "master" / "routes.csv"
-output_file.parent.mkdir(parents=True, exist_ok=True)
-routes = pd.DataFrame([vars(args)])
-routes.columns = ["route_id", "route_no", "route_name", "direction"]
-routes.to_csv(output_file, index=False, encoding="utf-8-sig")
+
+# ============================================================
+# 路線確認
+# ============================================================
+
+if args.route_id not in ROUTES:
+    print("エラー: 未対応のroute_idです")
+    print()
+    print("使用可能:")
+    for route_id in ROUTES:
+        print(f"  {route_id}")
+    raise SystemExit(1)
+
+
+config = ROUTES[args.route_id]
+
+
+# ============================================================
+# 出力先
+# ============================================================
+
+MASTER_DIR = (
+    BASE_DIR
+    / "data"
+    / "routes"
+    / args.route_id
+    / "master"
+)
+
+MASTER_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+# ============================================================
+# routes.csv
+# ============================================================
+
+routes = pd.DataFrame(
+    [
+        {
+            "route_id": args.route_id,
+            "route_no": config["route_no"],
+            "route_name": config["route_name"],
+            "direction": config["direction"],
+        }
+    ]
+)
+
+
+OUTPUT_FILE = MASTER_DIR / "routes.csv"
+
+routes.to_csv(
+    OUTPUT_FILE,
+    index=False,
+    encoding="utf-8-sig",
+)
+
+
+# ============================================================
+# 確認
+# ============================================================
+
 print(routes.to_string(index=False))
-print(f"保存: {output_file}")
+
+print()
+print("保存:")
+print(OUTPUT_FILE)
