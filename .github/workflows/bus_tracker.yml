@@ -7,28 +7,22 @@ on:
 
   workflow_dispatch:
     inputs:
-      route_id:
-        description: '追跡する路線'
-        required: true
-        type: choice
-        options:
-          - 89_up
-          - 98_up
-        default: 89_up
-
       ignore_time_check:
         description: '時間帯チェックを無視して即座に実行する（テスト用）'
         type: boolean
-        default: false
+        default: true
 
 concurrency:
-  group: bus-tracker
+  group: bus-tracker-${{ github.workflow }}
   cancel-in-progress: false
 
 jobs:
 
+  # ==========================================================
+  # 89番 糸満線 上り
+  # ==========================================================
   track-89:
-    if: github.event_name == 'schedule' || inputs.route_id == '89_up'
+    name: 89番 糸満線 上り
     runs-on: ubuntu-latest
     timeout-minutes: 190
 
@@ -50,14 +44,13 @@ jobs:
         run: pip install requests pandas beautifulsoup4
 
       - name: 89番を追跡
-        run: |
-          python -u scripts/tracker/bus_tracker.py --route 89_up
+        run: python -u scripts/tracker/bus_tracker.py --route 89_up
         env:
           TZ: Asia/Tokyo
-          IGNORE_TIME_CHECK: ${{ github.event_name == 'workflow_dispatch' && inputs.ignore_time_check && '1' || '0' }}
+          IGNORE_TIME_CHECK: ${{ inputs.ignore_time_check && '1' || '0' }}
           DEBUG_STATETABLE: "0"
 
-      - name: 89番のデータをコミット
+      - name: CSVとJSONをコミット
         if: always()
         run: |
           git config user.name "github-actions[bot]"
@@ -66,18 +59,20 @@ jobs:
           git pull --rebase origin main || true
 
           git add \
-            data/routes/89_up/bus_arrival_log.csv \
-            data/routes/89_up/bus_live_position.json \
-            || true
+            data/raw/89_up/bus_arrival_log.csv \
+            data/raw/89_up/bus_live_position.json || true
 
           git diff --staged --quiet || \
-            git commit -m "🚌 89_up バス到着記録 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
+            git commit -m "🚌 89番バス到着記録 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
 
           git push || true
 
 
+  # ==========================================================
+  # 98番 琉大線 上り
+  # ==========================================================
   track-98:
-    if: github.event_name == 'schedule' || inputs.route_id == '98_up'
+    name: 98番 琉大線 上り
     runs-on: ubuntu-latest
     timeout-minutes: 190
 
@@ -99,14 +94,13 @@ jobs:
         run: pip install requests pandas beautifulsoup4
 
       - name: 98番を追跡
-        run: |
-          python -u scripts/tracker/bus_tracker.py --route 98_up
+        run: python -u scripts/tracker/bus_tracker.py --route 98_up
         env:
           TZ: Asia/Tokyo
-          IGNORE_TIME_CHECK: ${{ github.event_name == 'workflow_dispatch' && inputs.ignore_time_check && '1' || '0' }}
+          IGNORE_TIME_CHECK: ${{ inputs.ignore_time_check && '1' || '0' }}
           DEBUG_STATETABLE: "0"
 
-      - name: 98番のデータをコミット
+      - name: CSVとJSONをコミット
         if: always()
         run: |
           git config user.name "github-actions[bot]"
@@ -115,11 +109,10 @@ jobs:
           git pull --rebase origin main || true
 
           git add \
-            data/routes/98_up/bus_arrival_log.csv \
-            data/routes/98_up/bus_live_position.json \
-            || true
+            data/raw/98_up/bus_arrival_log.csv \
+            data/raw/98_up/bus_live_position.json || true
 
           git diff --staged --quiet || \
-            git commit -m "🚌 98_up バス到着記録 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
+            git commit -m "🚌 98番バス到着記録 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
 
           git push || true
